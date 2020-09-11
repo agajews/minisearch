@@ -10,7 +10,10 @@ use regex::Regex;
 use http::Uri;
 use cbloom;
 use fasthash::metro::hash64;
-use std::convert::TryInto;
+use std::path::{Path, PathBuf};
+use std::fs::{File, create_dir_all};
+use std::io::Write;
+use ::minisearch::sparse::SparseU32Vec;
 
 struct Client {
     client: reqwest::Client,
@@ -187,73 +190,19 @@ impl LinkExtractor {
     }
 }
 
-struct SparseU32Vec {
-    data: Vec<u32>,
-    indices: Vec<u32>,
-}
-
-impl SparseU32Vec {
-    fn new() -> SparseU32Vec {
-        SparseU32Vec {
-            data: Vec::new(),
-            indices: Vec::new(),
-        }
-    }
-
-    fn add(&mut self, i: u32, x: u32) {
-        self.data.push(x);
-        self.indices.push(i);
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        let mut serialized = Vec::new();
-        serialized.extend_from_slice(&self.data.len().to_be_bytes());
-        for x in &self.data {
-            serialized.extend_from_slice(&x.to_be_bytes());
-        }
-        for i in &self.indices {
-            serialized.extend_from_slice(&i.to_be_bytes());
-        }
-        serialized
-    }
-
-    fn deserialize(serialized: &[u8]) -> Option<SparseU32Vec> {
-        let len = u32::from_be_bytes(serialized[0..4].try_into().ok()?) as usize;
-        let mut data = Vec::new();
-        let mut indices = Vec::new();
-        for i in 0..len {
-            let k = 4 + i * 4;
-            let x = u32::from_be_bytes(serialized[k..(k + 4)].try_into().ok()?);
-
-            let k = 4 + len * 4 + i * 4;
-            let idx = u32::from_be_bytes(serialized[k..(k + 4)].try_into().ok()?);
-
-            data.push(x);
-            indices.push(idx);
-        }
-
-        Some(SparseU32Vec { data, indices })
-    }
-
-    fn make_dense(&self, len: usize) -> Vec<u32> {
-        let mut dense = vec![0; len];
-        for (i, x) in self.indices.iter().zip(&self.data) {
-            dense[*i as usize] = *x;
-        }
-        dense
-    }
-}
-
 struct Index {
     terms: BTreeMap<String, SparseU32Vec>,
     n_terms: Vec<u32>,
     urls: Vec<String>,
     n: u32,
+    path: PathBuf,
 }
 
 impl Index {
-    fn new() -> Index {
+    fn new(path: PathBuf) -> Index {
+        create_dir_all(&path).unwrap();
         Index {
+            path,
             terms: BTreeMap::new(),
             n_terms: Vec::new(),
             urls: Vec::new(),
@@ -270,6 +219,62 @@ impl Index {
         self.urls.push(digest.url);
         self.n += 1;
     }
+
+    fn dump(&self) {
+        let mut encoded_terms = Vec::new();
+        let mut metadata = BTreeMap::new();
+        for (term, vec) in &self.terms {
+            let start = encoded_terms.len() as u32;
+            encoded_terms.extend_from_slice(&vec.serialize());
+            let end = encoded_terms.len() as u32;
+            metadata.insert(hash64(term), (start, end));
+        }
+
+        // TODO: better serialization abstraction
+        Self::sync_write(self.path.join("terms.bytes"), &encoded_terms);
+        Self::sync_write(self.path.join("metadata.bytes"), &Self::serialize_metadata(metadata));
+        Self::sync_write(self.path.join("urls.bytes"), &Self::serialize_urls(&self.urls));
+        Self::sync_write(self.path.join("n_terms.bytes"), &Self::serialize_n_terms(&self.n_terms));
+    }
+
+    fn serialize_metadata(metadata: BTreeMap<u64, (u32, u32)>) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for (hash, (start, end)) in metadata {
+            encoded.extend_from_slice(&hash.to_be_bytes());
+            encoded.extend_from_slice(&start.to_be_bytes());
+            encoded.extend_from_slice(&end.to_be_bytes());
+        }
+        encoded
+    }
+
+    fn serialize_urls(urls: &Vec<String>) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(urls.len() as u32).to_be_bytes());
+        let mut i: u32 = 0;
+        for url in urls {
+            encoded.extend_from_slice(&i.to_be_bytes());
+            encoded.extend_from_slice(&(url.len() as u32).to_be_bytes());
+            i += url.len() as u32;
+        }
+        for url in urls {
+            encoded.extend_from_slice(url.as_bytes());
+        }
+        encoded
+    }
+
+    fn serialize_n_terms(n_terms: &Vec<u32>) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for k in n_terms {
+            encoded.extend_from_slice(&k.to_be_bytes());
+        }
+        encoded
+    }
+
+    fn sync_write<P: AsRef<Path>>(path: P, bytes: &[u8]) {
+        let mut file = File::create(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+    }
 }
 
 #[tokio::main]
@@ -278,11 +283,12 @@ async fn main() {
     let seen = cbloom::Filter::new(1_000_000, 100_000);
     let pg = Url::parse("http://paulgraham.com").unwrap();
     let host = String::from(pg.host_str().unwrap());
+    seen.insert(hash64(pg.as_str()));
     urls.push_back(pg);
     let client = Client::new();
     let link_extractor = LinkExtractor::new();
     let term_extractor = TermExtractor::new();
-    let mut index = Index::new();
+    let mut index = Index::new("/tmp/pg/".into());
     loop {
         let url = match urls.pop_front() {
             Some(url) => url,
@@ -300,4 +306,5 @@ async fn main() {
             &mut urls,
         ).await;
     }
+    index.dump()
 }
