@@ -1,7 +1,7 @@
 use reqwest;
 use tokio;
 use url::Url;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, BTreeMap};
 use reqwest::redirect::Policy;
 use std::time::Duration;
 use std::error::Error;
@@ -10,6 +10,7 @@ use regex::Regex;
 use http::Uri;
 use cbloom;
 use fasthash::metro::hash64;
+use std::convert::TryInto;
 
 struct Client {
     client: reqwest::Client,
@@ -202,26 +203,27 @@ impl SparseU32Vec {
     }
 
     fn serialize(&self) -> Vec<u8> {
-        let serialized = Vec::new();
+        let mut serialized = Vec::new();
         serialized.extend_from_slice(&self.data.len().to_be_bytes());
-        for x in self.data {
+        for x in &self.data {
             serialized.extend_from_slice(&x.to_be_bytes());
         }
-        for i in self.indices {
+        for i in &self.indices {
             serialized.extend_from_slice(&i.to_be_bytes());
         }
+        serialized
     }
 
     fn deserialize(serialized: &[u8]) -> Option<SparseU32Vec> {
-        let len = u32::from_be_bytes(serialized[0..4].try_into()?) as usize;
-        let data = Vec::new();
-        let indices = Vec::new();
+        let len = u32::from_be_bytes(serialized[0..4].try_into().ok()?) as usize;
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
         for i in 0..len {
             let k = 4 + i * 4;
-            let x = u32::from_be_bytes(serialized[k..(k + 4)].try_into()?);
+            let x = u32::from_be_bytes(serialized[k..(k + 4)].try_into().ok()?);
 
             let k = 4 + len * 4 + i * 4;
-            let idx = u32::from_be_bytes(serialized[k..(k + 4)].try_into()?);
+            let idx = u32::from_be_bytes(serialized[k..(k + 4)].try_into().ok()?);
 
             data.push(x);
             indices.push(idx);
@@ -231,9 +233,9 @@ impl SparseU32Vec {
     }
 
     fn make_dense(&self, len: usize) -> Vec<u32> {
-        let dense = vec![0; len];
-        for (i, x) in zip![self.indices, self.data] {
-            dense[i] = x;
+        let mut dense = vec![0; len];
+        for (i, x) in self.indices.iter().zip(&self.data) {
+            dense[*i as usize] = *x;
         }
         dense
     }
@@ -242,11 +244,20 @@ impl SparseU32Vec {
 struct Index {
     terms: BTreeMap<String, SparseU32Vec>,
     n_terms: Vec<u32>,
-    urls: Vec<String>
+    urls: Vec<String>,
     n: u32,
 }
 
 impl Index {
+    fn new() -> Index {
+        Index {
+            terms: BTreeMap::new(),
+            n_terms: Vec::new(),
+            urls: Vec::new(),
+            n: 0,
+        }
+    }
+
     fn add(&mut self, digest: Digest) {
         for (term, count) in digest.terms {
             let rle = self.terms.entry(term).or_insert_with(|| SparseU32Vec::new());
@@ -266,7 +277,7 @@ async fn main() {
     let client = Client::new();
     let link_extractor = LinkExtractor::new();
     let term_extractor = TermExtractor::new();
-    let index = Index::new();
+    let mut index = Index::new();
     loop {
         let url = match urls.pop_front() {
             Some(url) => url,
