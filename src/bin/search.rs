@@ -1,9 +1,17 @@
-use std::convert::TryInto;
+#![feature(proc_macro_hygiene, decl_macro)]
+
+#[macro_use] extern crate rocket;
+
 use ::minisearch::sparse::SparseU32Vec;
+use std::convert::TryInto;
 use std::fs;
 use std::path::PathBuf;
 use fasthash::metro::hash64;
 use std::error::Error;
+use serde::Serialize;
+use rocket::State;
+use rocket_contrib::templates::Template;
+use std::time::Instant;
 
 struct Index {
     terms: Vec<(u64, SparseU32Vec)>,
@@ -93,7 +101,7 @@ impl Index {
         Some(counts)
     }
 
-    fn search(&self, terms: Vec<String>) -> Option<Vec<(String, f32)>> {
+    fn search(&self, terms: Vec<String>) -> Option<Vec<SearchResult>> {
         let counts = terms.into_iter().map(|term| self.get_count(&term))
             .collect::<Option<Vec<_>>>()?;
         let dfs = counts.iter().map(|counts| counts.iter().filter(|c| **c > 0).count())
@@ -106,19 +114,52 @@ impl Index {
                 score += counts[j][i] as f32 / self.n_terms[i] as f32 / dfs[j];
             }
             if score > 0.0 {
-                scores.push((self.urls[i].clone(), score));
+                scores.push(SearchResult { url: self.urls[i].clone(), score });
             }
         }
         // reverse sort
-        scores.sort_by(|(_, score_a), (_, score_b)| score_b.partial_cmp(score_a).unwrap());
+        scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         Some(scores)
     }
 }
 
+fn split_query(query: &str) -> Vec<String> {
+    let terms = query.split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect::<Vec<String>>();
+    terms
+}
+
+#[derive(Serialize)]
+struct SearchResult {
+    url: String,
+    score: f32,
+}
+
+#[derive(Serialize)]
+struct SearchContext {
+    results: Vec<SearchResult>,
+    search_time: usize,
+}
+
+#[get("/search?<query>")]
+fn search(query: String, index: State<Index>) -> Template {
+    let terms = split_query(&query);
+    let start = Instant::now();
+    let results = match index.search(terms) {
+        Some(results) => results,
+        None => vec![],
+    };
+    let context = SearchContext { results, search_time: start.elapsed().as_millis() as usize };
+    Template::render("search", &context)
+}
+
 fn main() {
     let index = Index::load("/tmp/pg".into()).unwrap();
-    let matches = index.search(vec!["fundraising".to_string(), "growth".to_string()]).unwrap();
-    for (url, score) in matches {
-        println!("{}: {}", url, score);
-    }
+
+    rocket::ignite()
+        .mount("/", routes![search])
+        .attach(Template::fairing())
+        .manage(index)
+        .launch();
 }

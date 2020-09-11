@@ -1,0 +1,28 @@
+<html>
+  <head>
+    <title>Search results</title>
+
+    <script>
+      function doSearch(event) {
+        event.preventDefault();
+	var query = document.getElementById("search").value;
+	window.location.href = "/search?query=" + encodeURIComponent(query);
+      }
+    </script>
+  </head>
+
+  <body>
+    <form onsubmit="doSearch(event)">
+      <input type="text" id="search" name="search">
+      <input type="submit">
+    </form>
+    <h1>Search results</h1>
+    <p>Another lightning fast search in only {{ search_time }}ms</p>
+
+    {% for result in results %}
+      <div>
+        <a href="{{ result.url }}">{{ result.url }}</a> ({{ result.score }})
+      </div>
+    {% endfor %}
+  </body>
+</html>
