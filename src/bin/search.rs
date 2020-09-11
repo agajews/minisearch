@@ -86,13 +86,25 @@ impl Index {
         Ok(n_terms)
     }
 
-    fn search(&self, term: &str) -> Option<Vec<(String, f32)>> {
+    fn get_count(&self, term: &str) -> Option<Vec<u32>> {
         let i = self.terms.binary_search_by_key(&hash64(term), |(a, _)| *a).ok()?;
         let (_, counts) = &self.terms[i];
         let counts = counts.make_dense(self.urls.len());
+        Some(counts)
+    }
+
+    fn search(&self, terms: Vec<String>) -> Option<Vec<(String, f32)>> {
+        let counts = terms.into_iter().map(|term| self.get_count(&term))
+            .collect::<Option<Vec<_>>>()?;
+        let dfs = counts.iter().map(|counts| counts.iter().filter(|c| **c > 0).count())
+            .map(|c| (c as f32).log2())
+            .collect::<Vec<_>>();
         let mut scores = Vec::with_capacity(counts.len());
-        for i in 0..(counts.len()) {
-            let score = counts[i] as f32 / self.n_terms[i] as f32;
+        for i in 0..(self.urls.len()) {
+            let mut score = 0.0;
+            for j in 0..(counts.len()) {
+                score += counts[j][i] as f32 / self.n_terms[i] as f32 / dfs[j];
+            }
             if score > 0.0 {
                 scores.push((self.urls[i].clone(), score));
             }
@@ -105,7 +117,7 @@ impl Index {
 
 fn main() {
     let index = Index::load("/tmp/pg".into()).unwrap();
-    let matches = index.search("fundraising").unwrap();
+    let matches = index.search(vec!["fundraising".to_string(), "growth".to_string()]).unwrap();
     for (url, score) in matches {
         println!("{}: {}", url, score);
     }
