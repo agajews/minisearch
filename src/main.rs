@@ -47,6 +47,7 @@ impl Client {
 }
 
 async fn handle_url(
+    host: &str,
     client: &Client,
     seen: &cbloom::Filter,
     link_extractor: &LinkExtractor,
@@ -62,7 +63,7 @@ async fn handle_url(
             return None;
         },
     };
-    let links = link_extractor.extract_links(&url, &text);
+    let links = link_extractor.extract_links(host, &url, &text);
     for link in links {
         let hash = hash64(link.as_str());
         if !seen.maybe_contains(hash) {
@@ -103,6 +104,7 @@ impl TermExtractor {
             for tag_text in self.tag_text_re.captures_iter(section.as_str()) {
                 for term in self.term_re.find_iter(&tag_text[1]) {
                     let term = term.as_str().to_lowercase();
+                    // println!("{}", term);
                     *terms.entry(term).or_insert(0) += 1;
                     n_terms += 1;
                 }
@@ -159,11 +161,12 @@ impl LinkExtractor {
             !url.starts_with("http")
     }
 
-    fn extract_links(&self, base_url: &Url, document: &str) -> Vec<Url> {
+    fn extract_links(&self, host: &str, base_url: &Url, document: &str) -> Vec<Url> {
         let links = self.link_re.find_iter(document)
             .map(|m| m.as_str())
             .map(|s| &s[6..s.len() - 1])
             .filter_map(|href| base_url.join(href).ok())
+            .filter(|url| url.host_str() == Some(host))
             .collect::<Vec<_>>();
         // if links.iter().filter_map(Self::looks_like_a_trap).any(|x| x) {
         //     return;
@@ -273,7 +276,9 @@ impl Index {
 async fn main() {
     let mut urls = VecDeque::new();
     let seen = cbloom::Filter::new(1_000_000, 100_000);
-    urls.push_back(Url::parse("http://paulgraham.com").unwrap());
+    let pg = Url::parse("http://paulgraham.com").unwrap();
+    let host = String::from(pg.host_str().unwrap());
+    urls.push_back(pg);
     let client = Client::new();
     let link_extractor = LinkExtractor::new();
     let term_extractor = TermExtractor::new();
@@ -285,6 +290,7 @@ async fn main() {
         };
         println!("crawling {}", url.as_str());
         handle_url(
+            &host,
             &client,
             &seen,
             &link_extractor,
