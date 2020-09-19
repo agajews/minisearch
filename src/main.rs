@@ -13,6 +13,11 @@ use fasthash::metro::hash64;
 use std::path::{Path, PathBuf};
 use std::fs::{File, create_dir_all};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time::delay_for;
+use tokio::sync::mpsc::{channel, Sender};
+
 use ::minisearch::sparse::SparseU32Vec;
 
 struct Client {
@@ -22,7 +27,7 @@ struct Client {
 impl Client {
     fn new() -> Client {
         let client = reqwest::Client::builder()
-            .user_agent("Minisearch/0.1")
+            .user_agent("Minisearch/0.2")
             .danger_accept_invalid_certs(true)
             .danger_accept_invalid_hostnames(true)
             .redirect(Policy::limited(100))
@@ -47,36 +52,6 @@ impl Client {
         }
         Ok(String::from_utf8_lossy(&data).to_string())
     }
-}
-
-async fn handle_url(
-    host: &str,
-    client: &Client,
-    seen: &cbloom::Filter,
-    link_extractor: &LinkExtractor,
-    term_extractor: &TermExtractor,
-    index: &mut Index,
-    url: Url,
-    urls: &mut VecDeque<Url>,
-) -> Option<()> {
-    let text = match client.fetch(url.clone()).await {
-        Ok(text) => text,
-        Err(err) => {
-            println!("failed to crawl {:?}: {:?}", url, err);
-            return None;
-        },
-    };
-    let links = link_extractor.extract_links(host, &url, &text);
-    for link in links {
-        let hash = hash64(link.as_str());
-        if !seen.maybe_contains(hash) {
-            seen.insert(hash);
-            urls.push_back(link);
-        }
-    }
-    let digest = term_extractor.digest(url.into_string(), &text);
-    index.add(digest);
-    Some(())
 }
 
 struct Digest {
@@ -164,12 +139,13 @@ impl LinkExtractor {
             !url.starts_with("http")
     }
 
-    fn extract_links(&self, host: &str, base_url: &Url, document: &str) -> Vec<Url> {
+    fn extract_links(&self, base_url: &Url, document: &str) -> Vec<Url> {
+        let parent_host = base_url.host_str();
         let links = self.link_re.find_iter(document)
             .map(|m| m.as_str())
             .map(|s| &s[6..s.len() - 1])
             .filter_map(|href| base_url.join(href).ok())
-            .filter(|url| url.host_str() == Some(host))
+            .filter(|url| url.host_str() == parent_host)
             .collect::<Vec<_>>();
         // if links.iter().filter_map(Self::looks_like_a_trap).any(|x| x) {
         //     return;
@@ -277,34 +253,209 @@ impl Index {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let mut urls = VecDeque::new();
-    let seen = cbloom::Filter::new(1_000_000, 100_000);
-    let pg = Url::parse("http://paulgraham.com").unwrap();
-    let host = String::from(pg.host_str().unwrap());
-    seen.insert(hash64(pg.as_str()));
-    urls.push_back(pg);
-    let client = Client::new();
+// async fn handle_url(
+//     hosts: &Vec<String>,
+//     client: &Client,
+//     seen: &cbloom::Filter,
+//     link_extractor: &LinkExtractor,
+//     term_extractor: &TermExtractor,
+//     index: &mut Index,
+//     url: Url,
+//     urls: &mut VecDeque<Url>,
+// ) -> Option<()> {
+//     let text = match client.fetch(url.clone()).await {
+//         Ok(text) => text,
+//         Err(err) => {
+//             println!("failed to crawl {:?}: {:?}", url, err);
+//             return None;
+//         },
+//     };
+//     let links = link_extractor.extract_links(hosts, &url, &text);
+//     for link in links {
+//         let hash = hash64(link.as_str());
+//         if !seen.maybe_contains(hash) {
+//             seen.insert(hash);
+//             urls.push_back(link);
+//         }
+//     }
+//     let digest = term_extractor.digest(url.into_string(), &text);
+//     index.add(digest);
+//     Some(())
+// }
+
+// #[tokio::main]
+// async fn main() {
+//     let mut urls = VecDeque::new();
+//     let seen = cbloom::Filter::new(1_000_000, 100_000);
+//     let sites = vec![
+//         "http://paulgraham.com",
+//         "http://blog.samaltman.com",
+//         "http://www.catb.org",
+//         "http://paulbuchheit.blogspot.com",
+//         "https://www.joelonsoftware.com",
+//         "https://blog.pmarca.com",
+//         "https://www.scottaaronson.com",
+//         "https://slatestarcodex.com",
+//         "https://www.brainpickings.org",
+//         "https://patrickcollison.com",
+//         "https://www.gwern.net",
+//         "https://marginalrevolution.com",
+//         "http://lukemuehlhauser.com",
+//         "https://lemire.me/blog/",
+//         "https://guzey.com",
+//         "https://nintil.com",
+//         "https://jakeseliger.com",
+//         "http://michaelnielsen.org",
+//         "https://vitalik.ca",
+//         "https://lacker.io",
+//     ];
+//     let mut hosts = Vec::new();
+//     for site in sites {
+//         let url = Url::parse(site).unwrap();
+//         let host = String::from(url.host_str().unwrap());
+//         hosts.push(host);
+//         seen.insert(hash64(url.as_str()));
+//         urls.push_back(url);
+//     }
+//     let client = Client::new();
+//     let link_extractor = LinkExtractor::new();
+//     let term_extractor = TermExtractor::new();
+//     let mut index = Index::new("/tmp/alexsearch/".into());
+//     loop {
+//         let url = match urls.pop_front() {
+//             Some(url) => url,
+//             None => break,
+//         };
+//         println!("crawling {}", url.as_str());
+//         handle_url(
+//             &hosts,
+//             &client,
+//             &seen,
+//             &link_extractor,
+//             &term_extractor,
+//             &mut index,
+//             url,
+//             &mut urls,
+//         ).await;
+//     }
+//     index.dump()
+// }
+
+async fn crawler_thread(
+    mut index_sender: Sender<Digest>,
+    queue: Arc<Mutex<VecDeque<Url>>>,
+    n_finished: Arc<AtomicUsize>,
+    seen: Arc<cbloom::Filter>,
+) {
     let link_extractor = LinkExtractor::new();
     let term_extractor = TermExtractor::new();
-    let mut index = Index::new("/tmp/pg/".into());
+    let client = Client::new();
+    let mut waiting = false;
     loop {
-        let url = match urls.pop_front() {
-            Some(url) => url,
-            None => break,
+        let url = {
+            let maybe_url = {
+                let mut queue = queue.lock().unwrap();
+                queue.pop_front()
+            };
+            match maybe_url {
+                Some(url) => {
+                    if waiting {
+                        n_finished.fetch_sub(1, Ordering::Relaxed);
+                        waiting = false;
+                    }
+                    url
+                },
+                None => {
+                    delay_for(Duration::from_secs(1)).await;
+                    if !waiting {
+                        n_finished.fetch_add(1, Ordering::Relaxed);
+                        waiting = true;
+                    }
+                    continue;
+                }
+            }
         };
         println!("crawling {}", url.as_str());
-        handle_url(
-            &host,
-            &client,
-            &seen,
-            &link_extractor,
-            &term_extractor,
-            &mut index,
-            url,
-            &mut urls,
-        ).await;
+
+        let text = match client.fetch(url.clone()).await {
+            Ok(text) => text,
+            Err(err) => {
+                println!("failed to crawl {:?}: {:?}", url, err);
+                continue;
+            },
+        };
+        let links = link_extractor.extract_links(&url, &text);
+        {
+            let mut queue = queue.lock().unwrap();
+            for link in links {
+                let hash = hash64(link.as_str());
+                if !seen.maybe_contains(hash) {
+                    seen.insert(hash);
+                    queue.push_back(link);
+                }
+            }
+        }
+        let digest = term_extractor.digest(url.into_string(), &text);
+        if let Err(_) = index_sender.send(digest).await {
+            panic!("index channel closed");
+        };
     }
-    index.dump()
+}
+
+const THREADS_PER_HOST: usize = 10;
+
+#[tokio::main]
+async fn main() {
+    let hosts = vec![
+        "http://paulgraham.com",
+        "http://blog.samaltman.com",
+        // "http://www.catb.org",
+        // "http://paulbuchheit.blogspot.com",
+        // "https://www.joelonsoftware.com",
+        // "https://blog.pmarca.com",
+        // "https://www.scottaaronson.com",
+        "https://slatestarcodex.com",
+        // "https://www.brainpickings.org",
+        // "https://patrickcollison.com",
+        // "https://www.gwern.net",
+        // "https://marginalrevolution.com",
+        // "http://lukemuehlhauser.com",
+        // "https://lemire.me/blog/",
+        // "https://guzey.com",
+        // "https://nintil.com",
+        // "https://jakeseliger.com",
+        // "http://michaelnielsen.org",
+        // "https://vitalik.ca",
+        // "https://lacker.io",
+    ];
+    let (index_sender, mut index_receiver) = channel(4096);
+    let n_finished = Arc::new(AtomicUsize::new(0));
+    let n_threads = hosts.len() * THREADS_PER_HOST;
+    let mut index = Index::new("/tmp/alexsearch/".into());
+    let seen = Arc::new(cbloom::Filter::new(1_000_000, 100_000));
+    for host in hosts {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let url = Url::parse(host).unwrap();
+            println!("loading url {}", url.as_str());
+            seen.insert(hash64(url.as_str()));
+            queue.lock().unwrap().push_back(url);
+        }
+        for _ in 0..THREADS_PER_HOST {
+            let index_sender = index_sender.clone();
+            let queue = queue.clone();
+            let n_finished = n_finished.clone();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                crawler_thread(index_sender, queue, n_finished, seen).await
+            });
+        }
+    }
+    while let Some(digest) = index_receiver.recv().await {
+        index.add(digest);
+        if n_finished.load(Ordering::Relaxed) >= n_threads {
+            break;
+        }
+    }
+    index.dump();
 }

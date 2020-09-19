@@ -17,7 +17,7 @@
       <input type="submit">
     </form>
     <h1>Search results</h1>
-    <p>Another lightning fast search in only {{ search_time }}ms</p>
+    <p>Another lightning fast search in only {{ search_time }}us</p>
 
     {% for result in results %}
       <div>

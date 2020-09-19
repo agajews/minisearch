@@ -105,13 +105,16 @@ impl Index {
         let counts = terms.into_iter().map(|term| self.get_count(&term))
             .collect::<Option<Vec<_>>>()?;
         let dfs = counts.iter().map(|counts| counts.iter().filter(|c| **c > 0).count())
-            .map(|c| (c as f32).log2())
+            .map(|c| c as f32)
             .collect::<Vec<_>>();
         let mut scores = Vec::with_capacity(counts.len());
-        for i in 0..(self.urls.len()) {
+        'outer: for i in 0..(self.urls.len()) {
             let mut score = 0.0;
             for j in 0..(counts.len()) {
-                score += counts[j][i] as f32 / self.n_terms[i] as f32 / dfs[j];
+                if counts[j][i] == 0 {
+                    continue 'outer;
+                }
+                score += counts[j][i] as f32 / dfs[j];
             }
             if score > 0.0 {
                 scores.push(SearchResult { url: self.urls[i].clone(), score });
@@ -150,12 +153,12 @@ fn search(query: String, index: State<Index>) -> Template {
         Some(results) => results,
         None => vec![],
     };
-    let context = SearchContext { results, search_time: start.elapsed().as_millis() as usize };
+    let context = SearchContext { results, search_time: start.elapsed().as_micros() as usize };
     Template::render("search", &context)
 }
 
 fn main() {
-    let index = Index::load("/tmp/pg".into()).unwrap();
+    let index = Index::load("/tmp/alexsearch".into()).unwrap();
 
     rocket::ignite()
         .mount("/", routes![search])
