@@ -15,6 +15,7 @@ use std::fs::{File, create_dir_all};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time::delay_for;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use ::minisearch::sparse::SparseU32Vec;
@@ -252,94 +253,6 @@ impl Index {
     }
 }
 
-// async fn handle_url(
-//     hosts: &Vec<String>,
-//     client: &Client,
-//     seen: &cbloom::Filter,
-//     link_extractor: &LinkExtractor,
-//     term_extractor: &TermExtractor,
-//     index: &mut Index,
-//     url: Url,
-//     urls: &mut VecDeque<Url>,
-// ) -> Option<()> {
-//     let text = match client.fetch(url.clone()).await {
-//         Ok(text) => text,
-//         Err(err) => {
-//             println!("failed to crawl {:?}: {:?}", url, err);
-//             return None;
-//         },
-//     };
-//     let links = link_extractor.extract_links(hosts, &url, &text);
-//     for link in links {
-//         let hash = hash64(link.as_str());
-//         if !seen.maybe_contains(hash) {
-//             seen.insert(hash);
-//             urls.push_back(link);
-//         }
-//     }
-//     let digest = term_extractor.digest(url.into_string(), &text);
-//     index.add(digest);
-//     Some(())
-// }
-
-// #[tokio::main]
-// async fn main() {
-//     let mut urls = VecDeque::new();
-//     let seen = cbloom::Filter::new(1_000_000, 100_000);
-//     let sites = vec![
-//         "http://paulgraham.com",
-//         "http://blog.samaltman.com",
-//         "http://www.catb.org",
-//         "http://paulbuchheit.blogspot.com",
-//         "https://www.joelonsoftware.com",
-//         "https://blog.pmarca.com",
-//         "https://www.scottaaronson.com",
-//         "https://slatestarcodex.com",
-//         "https://www.brainpickings.org",
-//         "https://patrickcollison.com",
-//         "https://www.gwern.net",
-//         "https://marginalrevolution.com",
-//         "http://lukemuehlhauser.com",
-//         "https://lemire.me/blog/",
-//         "https://guzey.com",
-//         "https://nintil.com",
-//         "https://jakeseliger.com",
-//         "http://michaelnielsen.org",
-//         "https://vitalik.ca",
-//         "https://lacker.io",
-//     ];
-//     let mut hosts = Vec::new();
-//     for site in sites {
-//         let url = Url::parse(site).unwrap();
-//         let host = String::from(url.host_str().unwrap());
-//         hosts.push(host);
-//         seen.insert(hash64(url.as_str()));
-//         urls.push_back(url);
-//     }
-//     let client = Client::new();
-//     let link_extractor = LinkExtractor::new();
-//     let term_extractor = TermExtractor::new();
-//     let mut index = Index::new("/tmp/alexsearch/".into());
-//     loop {
-//         let url = match urls.pop_front() {
-//             Some(url) => url,
-//             None => break,
-//         };
-//         println!("crawling {}", url.as_str());
-//         handle_url(
-//             &hosts,
-//             &client,
-//             &seen,
-//             &link_extractor,
-//             &term_extractor,
-//             &mut index,
-//             url,
-//             &mut urls,
-//         ).await;
-//     }
-//     index.dump()
-// }
-
 async fn crawler_thread(
     idx: usize,
     mut work_receiver: Receiver<Url>,
@@ -436,26 +349,26 @@ async fn main() {
     let hosts = vec![
         "http://paulgraham.com",
         "http://blog.samaltman.com",
-        "http://www.catb.org",
-        "http://paulbuchheit.blogspot.com",
-        "https://www.joelonsoftware.com",
-        "https://blog.pmarca.com",
-        "https://www.scottaaronson.com",
-        "https://slatestarcodex.com",
-        "https://www.brainpickings.org",
-        "https://patrickcollison.com",
-        "https://www.gwern.net",
-        "https://marginalrevolution.com",
-        "http://lukemuehlhauser.com",
-        "https://lemire.me/blog/",
-        "https://guzey.com",
-        "https://nintil.com",
-        "https://jakeseliger.com",
-        "http://michaelnielsen.org",
-        "https://vitalik.ca",
-        "https://lacker.io",
-        "https://blog.zkga.me",
-        "http://planetbanatt.net",
+        // "http://www.catb.org",
+        // "http://paulbuchheit.blogspot.com",
+        // "https://www.joelonsoftware.com",
+        // "https://blog.pmarca.com",
+        // "https://www.scottaaronson.com",
+        // "https://slatestarcodex.com",
+        // "https://www.brainpickings.org",
+        // "https://patrickcollison.com",
+        // "https://www.gwern.net",
+        // "https://marginalrevolution.com",
+        // "http://lukemuehlhauser.com",
+        // "https://lemire.me/blog/",
+        // "https://guzey.com",
+        // "https://nintil.com",
+        // "https://jakeseliger.com",
+        // "http://michaelnielsen.org",
+        // "https://vitalik.ca",
+        // "https://lacker.io",
+        // "https://blog.zkga.me",
+        // "http://planetbanatt.net",
     ];
 
     let (index_sender, mut index_receiver) = channel(4096);
@@ -471,12 +384,16 @@ async fn main() {
             host_thread(host, index_sender, seen, n_finished).await
         });
     }
-    while let Some(digest) = index_receiver.recv().await {
-        index.add(digest);
+    loop {
         let n_finished = n_finished.load(Ordering::Relaxed);
-        println!("n finished: {}", n_finished);
-        if n_finished == hosts.len() {
-            break;
+        if let Ok(digest) = index_receiver.try_recv() {
+            index.add(digest);
+            println!("n finished: {}", n_finished);
+        } else {
+            delay_for(Duration::from_millis(10)).await;
+            if n_finished == hosts.len() {
+                break;
+            }
         }
     }
     println!("dumping index");
