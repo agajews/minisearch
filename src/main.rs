@@ -13,10 +13,9 @@ use fasthash::metro::hash64;
 use std::path::{Path, PathBuf};
 use std::fs::{File, create_dir_all};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::time::delay_for;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 use ::minisearch::sparse::SparseU32Vec;
 
@@ -342,39 +341,16 @@ impl Index {
 // }
 
 async fn crawler_thread(
+    idx: usize,
+    mut work_receiver: Receiver<Url>,
     mut index_sender: Sender<Digest>,
-    queue: Arc<Mutex<VecDeque<Url>>>,
-    n_finished: Arc<AtomicUsize>,
+    mut done_sender: Sender<(usize, Vec<Url>)>,
     seen: Arc<cbloom::Filter>,
 ) {
     let link_extractor = LinkExtractor::new();
     let term_extractor = TermExtractor::new();
     let client = Client::new();
-    let mut waiting = false;
-    loop {
-        let url = {
-            let maybe_url = {
-                let mut queue = queue.lock().unwrap();
-                queue.pop_front()
-            };
-            match maybe_url {
-                Some(url) => {
-                    if waiting {
-                        n_finished.fetch_sub(1, Ordering::Relaxed);
-                        waiting = false;
-                    }
-                    url
-                },
-                None => {
-                    delay_for(Duration::from_secs(1)).await;
-                    if !waiting {
-                        n_finished.fetch_add(1, Ordering::Relaxed);
-                        waiting = true;
-                    }
-                    continue;
-                }
-            }
-        };
+    while let Some(url) = work_receiver.recv().await {
         println!("crawling {}", url.as_str());
 
         let text = match client.fetch(url.clone()).await {
@@ -385,13 +361,13 @@ async fn crawler_thread(
             },
         };
         let links = link_extractor.extract_links(&url, &text);
+        let mut found = Vec::new();
         {
-            let mut queue = queue.lock().unwrap();
             for link in links {
                 let hash = hash64(link.as_str());
                 if !seen.maybe_contains(hash) {
                     seen.insert(hash);
-                    queue.push_back(link);
+                    found.push(link);
                 }
             }
         }
@@ -399,7 +375,58 @@ async fn crawler_thread(
         if let Err(_) = index_sender.send(digest).await {
             panic!("index channel closed");
         };
+        if let Err(_) = done_sender.send((idx, found)).await {
+            panic!("done channel closed");
+        };
     }
+}
+
+async fn host_thread(
+    host: Url,
+    index_sender: Sender<Digest>,
+    seen: Arc<cbloom::Filter>,
+    n_finished: Arc<AtomicUsize>,
+) {
+    let mut queue = VecDeque::new();
+    let mut waiting = Vec::new();
+    let (done_sender, mut done_receiver) = channel(4096);
+    let mut work_senders = Vec::new();
+    for idx in 0..THREADS_PER_HOST {
+        let index_sender = index_sender.clone();
+        let done_sender = done_sender.clone();
+        let seen = seen.clone();
+        let (work_sender, work_receiver) = channel(4096);
+        work_senders.push(work_sender);
+        tokio::spawn(async move {
+            crawler_thread(idx, work_receiver, index_sender, done_sender, seen).await
+        });
+    }
+
+    work_senders[0].send(host).await.unwrap();
+    for i in 1..THREADS_PER_HOST {
+        waiting.push(i);
+    }
+
+    while let Some((idx, found)) = done_receiver.recv().await {
+        for url in found {
+            queue.push_back(url);
+        }
+        waiting.push(idx);
+        if queue.is_empty() && waiting.len() == THREADS_PER_HOST {
+            break;
+        }
+        while let Some(idx) = waiting.pop() {
+            match queue.pop_front() {
+                Some(url) => work_senders[idx].send(url).await.unwrap(),
+                None => {
+                    waiting.push(idx);
+                    break;
+                },
+            }
+        }
+    }
+
+    n_finished.fetch_add(1, Ordering::Relaxed);
 }
 
 const THREADS_PER_HOST: usize = 10;
@@ -409,53 +436,50 @@ async fn main() {
     let hosts = vec![
         "http://paulgraham.com",
         "http://blog.samaltman.com",
-        // "http://www.catb.org",
-        // "http://paulbuchheit.blogspot.com",
-        // "https://www.joelonsoftware.com",
-        // "https://blog.pmarca.com",
-        // "https://www.scottaaronson.com",
+        "http://www.catb.org",
+        "http://paulbuchheit.blogspot.com",
+        "https://www.joelonsoftware.com",
+        "https://blog.pmarca.com",
+        "https://www.scottaaronson.com",
         "https://slatestarcodex.com",
-        // "https://www.brainpickings.org",
-        // "https://patrickcollison.com",
-        // "https://www.gwern.net",
-        // "https://marginalrevolution.com",
-        // "http://lukemuehlhauser.com",
-        // "https://lemire.me/blog/",
-        // "https://guzey.com",
-        // "https://nintil.com",
-        // "https://jakeseliger.com",
-        // "http://michaelnielsen.org",
-        // "https://vitalik.ca",
-        // "https://lacker.io",
+        "https://www.brainpickings.org",
+        "https://patrickcollison.com",
+        "https://www.gwern.net",
+        "https://marginalrevolution.com",
+        "http://lukemuehlhauser.com",
+        "https://lemire.me/blog/",
+        "https://guzey.com",
+        "https://nintil.com",
+        "https://jakeseliger.com",
+        "http://michaelnielsen.org",
+        "https://vitalik.ca",
+        "https://lacker.io",
+        "https://blog.zkga.me",
+        "http://planetbanatt.net",
     ];
+
     let (index_sender, mut index_receiver) = channel(4096);
     let n_finished = Arc::new(AtomicUsize::new(0));
-    let n_threads = hosts.len() * THREADS_PER_HOST;
-    let mut index = Index::new("/tmp/alexsearch/".into());
+    let mut index = Index::new("./alexsearch/".into());
     let seen = Arc::new(cbloom::Filter::new(1_000_000, 100_000));
-    for host in hosts {
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        {
-            let url = Url::parse(host).unwrap();
-            println!("loading url {}", url.as_str());
-            seen.insert(hash64(url.as_str()));
-            queue.lock().unwrap().push_back(url);
-        }
-        for _ in 0..THREADS_PER_HOST {
-            let index_sender = index_sender.clone();
-            let queue = queue.clone();
-            let n_finished = n_finished.clone();
-            let seen = seen.clone();
-            tokio::spawn(async move {
-                crawler_thread(index_sender, queue, n_finished, seen).await
-            });
-        }
+    for host in hosts.iter() {
+        let index_sender = index_sender.clone();
+        let seen = seen.clone();
+        let n_finished = n_finished.clone();
+        let host = Url::parse(host).unwrap();
+        tokio::spawn(async move {
+            host_thread(host, index_sender, seen, n_finished).await
+        });
     }
     while let Some(digest) = index_receiver.recv().await {
         index.add(digest);
-        if n_finished.load(Ordering::Relaxed) >= n_threads {
+        let n_finished = n_finished.load(Ordering::Relaxed);
+        println!("n finished: {}", n_finished);
+        if n_finished == hosts.len() {
             break;
         }
     }
+    println!("dumping index");
     index.dump();
+    println!("done!");
 }
